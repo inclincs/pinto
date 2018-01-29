@@ -1,178 +1,343 @@
-# -*- coding: utf8 -*-
-
 import sys
-
-import cv2
-import numpy as np
+import os
+import io
+import math
 import struct
+import numpy
+import cv2
 
-from time import time
+from functools import reduce
 
-from lib.pinto.codec import encode, decode
-from lib.pinto.common import filename, ext, getROI, setROI, parse
-
-
-
-def face(frame, cascade):
-    return list(cascade.detectMultiScale(
-        frame,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(30, 30),
-        flags=cv2.CASCADE_SCALE_IMAGE
-    ))
+from pinto import PintoConfiguration, PintoMeta, PintoVideo, PintoDetect, PintoBlock, error, h_pixelate
+from jpeg import Bitstream
 
 
 
-def license_plate(frame, cascade):
-    return list(cascade.detectMultiScale(
-        frame,
-        scaleFactor=1.3,
-        minNeighbors=5,
-        minSize=(60, 10),
-        flags=cv2.CASCADE_DO_CANNY_PRUNING
-    ))
+def detect(image, row, column, mode, unit=16):
+	pinto_blocks = []
+
+	areas = []
+	for m in PintoDetect.modes[mode.lower()]:
+		areas += m[0](image, m[1])
+
+	width, height = image.shape[1::-1]
+
+	row = 1 if row < 1 else math.ceil(height / unit) if row > math.ceil(height / unit) else row
+	column = 1 if column < 1 else math.ceil(width / unit) if column > math.ceil(width / unit) else column
+
+	jrow = math.ceil(height / unit)
+	jcolumn = math.ceil(width / unit)
+
+	s = set()
+	for (x, y, w, h) in areas:
+		sci = PintoBlock.index(x // unit, jcolumn, column)
+		sri = PintoBlock.index(y // unit, jrow, row)
+		eci = PintoBlock.index((x + w - 1) // unit, jcolumn, column) + 1
+		eri = PintoBlock.index((y + h - 1) // unit, jrow, row) + 1
+		xv, yv = numpy.meshgrid(numpy.arange(sci, eci), numpy.arange(sri * column, eri * column, column))
+		s.update((xv + yv).flatten().tolist())
+
+	for index in list(s):
+		ri, ci = index // column, index % column
+		sx = PintoBlock.position(ci, column, width, unit)
+		ex = PintoBlock.position(ci + 1, column, width, unit)
+		sy = PintoBlock.position(ri, row, height, unit)
+		ey = PintoBlock.position(ri + 1, row, height, unit)
+		pinto_blocks.append({ 'index': index, 'data': image[sy:ey, sx:ex].copy() })
+
+	return pinto_blocks
+
+def lossless_encode(image):
+	success, encoded = cv2.imencode('.png', image, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+	return None if not success else encoded.tostring()
+
+def modify(jpeg, pinto_blocks, row, column, unit=16):
+	byte2int = lambda bytes: int.from_bytes(bytes, byteorder='big')
+	nibble = lambda byte: (byte >> 4, byte & 0x0F)
+
+	coefficient_lookup_table = lambda v, l: v if v >= 1 << l - 1 else v - (1 << l) + 1
+
+	DC, AC = 0, 1
+	LUMINANCE, CHROMINANCE = 0, 1
+	Y = LUMINANCE
+	Cb = Cr = I = Q = CHROMINANCE
+
+	COMPONENT_ID = { 1: Y, 2: Cb, 3: Cr, 4: I, 5: Q }
+
+
+	# decode information data
+	jd = jpeg_data = {}
+
+	reader = io.BytesIO(jpeg)
+	while True:
+		b = reader.read(1)
+		if not b: break
+
+		b = byte2int(b)
+		if b == 0xFF:
+			b = byte2int(reader.read(1))
+			if b == 0xD8:
+				jd['SOI'] = { 'offset': reader.tell()-2 }
+				# print('SOI')
+
+			elif 0xE0 <= b <= 0xEF:
+				app = 'APP{APP_INDEX}'.format(APP_INDEX=(b - 0xE0))
+				jd[app] = { 'offset': reader.tell()-2 }
+				# print(app)
+				size = byte2int(reader.read(2))
+
+				jd[app]['data'] = reader.read(size - 2)
+
+			elif b == 0xDB:
+				if 'DQT' not in jd: jd['DQT'] = { 'offset': reader.tell()-2, 'data': {} }
+				# print('DQT')
+				size = byte2int(reader.read(2))
+				
+				while size > 2:
+					qt = {}
+					qt['precision'], qt['id'] = nibble(byte2int(reader.read(1)))
+					qt['table'] = reader.read((qt['precision'] + 1) * 64)
+					size -= 1 + (qt['precision'] + 1) * 64
+					jd['DQT']['data'][qt['id']] = qt
+
+			elif 0xC0 <= b <= 0xCF and b != 0xC4 and b != 0xC8 and b != 0xCC:
+				jd['SOF'] = { 'offset': reader.tell()-2, 'data': {} }
+				# print('SOF {SOF_INDEX}'.format(SOF_INDEX=(b - 0xC0)))
+				size = byte2int(reader.read(2))
+				
+				jd['SOF']['data']['precision'] = sof_precision = byte2int(reader.read(1))
+				jd['SOF']['data']['height'] = sof_height = byte2int(reader.read(2))
+				jd['SOF']['data']['width'] = sof_width = byte2int(reader.read(2))
+				jd['SOF']['data']['component count'] = byte2int(reader.read(1))
+				jd['SOF']['data']['components'] = []
+				for i in range((size - 8) // 3):
+					sof_component = {}
+					sof_component['component id'] = byte2int(reader.read(1)) # 1 = Y, 2 = Cb, 3 = Cr, 4 = I, 5 = Q
+					sof_vertical, sof_horizontal = nibble(byte2int(reader.read(1))) # bit 0-3 vertical, 4-7 horizontal
+					sof_component['sampling factors'] = { 'vertical': sof_vertical, 'horizontal': sof_horizontal }
+					sof_component['quantization table id'] = byte2int(reader.read(1))
+					jd['SOF']['data']['components'].append(sof_component)
+
+
+			elif b == 0xC4:
+				if 'DHT' not in jd: jd['DHT'] = { 'offset': reader.tell()-2, 'data': { LUMINANCE: {}, CHROMINANCE: {} } }
+				# print('DHT')
+				size = byte2int(reader.read(2))
+
+				while size > 2:
+					ht = {}
+					ht['type'], ht['id'] = nibble(byte2int(reader.read(1)))
+
+					ht['code count'] = [ n for n in reader.read(16) ]
+					total = reduce(lambda x, y: x + y, ht['code count'])
+
+					if total > 256: error('total code count > 256')
+
+					ht['value'] = [ v for v in reader.read(total) ]
+					ht['table'] = {}
+					code = index = 0
+					for depth in range(16):
+						for _ in range(ht['code count'][depth]):
+							ht['table'][(code, depth + 1)] = ht['value'][index]
+							index += 1
+							code += 1
+						code <<= 1
+					size -= 17 + total
+
+					jd['DHT']['data'][ht['id']][ht['type']] = ht
+
+			elif b == 0xDA:
+				jd['SOS'] = { 'offset': reader.tell()-2, 'data': {} }
+				# print('SOS')
+				size = byte2int(reader.read(2))
+
+				jd['SOS']['data']['component count'] = byte2int(reader.read(1))
+				jd['SOS']['data']['components'] = []
+				for i in range(jd['SOS']['data']['component count']):
+					sos_component = {}
+					sos_component['component id'] = byte2int(reader.read(1))
+					sos_component['huffman table id'] = nibble(byte2int(reader.read(1)))[::-1] # bit 0-3 AC table, 4-7 DC table
+					jd['SOS']['data']['components'].append(sos_component)
+
+				reader.read(3) # skip 3 bytes
+
+				jd['DATA'] = { 'offset': reader.tell(), 'data': b'' }
+
+			elif b == 0x00:
+				if 'DATA' in jd:
+					jd['DATA']['data'] += bytes([0xFF])
+
+			elif b == 0xD9:
+				jd['EOI'] = { 'offset': reader.tell()-2 }
+				# print('EOI')
+
+			else:
+				error('not expected marker: {0:X}'.format(read))
+		else:
+			if 'DATA' in jd: jd['DATA']['data'] += bytes([b])
+
+
+	# decode image data
+	width, height = jd['SOF']['data']['width'], jd['SOF']['data']['height']
+
+	jrow = math.ceil(height / unit)
+	jcolumn = math.ceil(width / unit)
+
+	jb_index = lambda pb_i, pb_n, px_n, jb_u: math.floor(pb_i * px_n / pb_n / jb_u)
+
+	s = set()
+	for pinto_block in pinto_blocks:
+		index = pinto_block['index']
+		ri, ci = index // column, index % column
+		sci = jb_index(ci, column, width, unit)
+		eci = jb_index(ci + 1, column, width, unit)
+		sri = jb_index(ri, row, height, unit)
+		eri = jb_index(ri + 1, row, height, unit)
+		xv, yv = numpy.meshgrid(numpy.arange(sci, eci), numpy.arange(sri * jcolumn, eri * jcolumn, jcolumn))
+		s.update((xv + yv).flatten().tolist())
+	detected = list(s)
+
+	bs_reader = Bitstream(jd['DATA']['data'])
+	bs_writer = Bitstream()
+	mcus = []
+	mcu = []
+	du = []
+
+	sof_components = jd['SOF']['data']['components']
+	sos_components = jd['SOS']['data']['components']
+
+	components = []
+	for i in range(len(sof_components)):
+		sc, fc = sos_components[i], sof_components[i]
+
+		component = {}
+		component['table'] = { t: jd['DHT']['data'][sc['huffman table id'][t]][t]['table'] for t in (DC, AC) }
+		component['itable'] = { t: { v: k for k, v in component['table'][t].items() } for t in (DC, AC) }
+		component['id'] = sc['component id']
+
+		for _ in range(fc['sampling factors']['vertical'] * fc['sampling factors']['horizontal']):
+			components.append(component)
+
+	diff = { k: 0 for k in COMPONENT_ID }
+
+	c = 0
+	d = 0
+
+	while True:
+		try:
+			bit = bs_reader.read()
+		except: break
+
+		c = (c << 1) | bit
+		d += 1
+
+		if len(du) == 0:
+			ht = components[len(mcu)]['table'][DC]
+
+			if (c, d) in ht:
+				# DC: (length:huff) (value:dc_table)
+				length = ht[(c, d)]
+
+				if length == 0:
+					value = 0
+				else:
+					temp = bs_reader.read(length)
+					value = coefficient_lookup_table(temp, length)
+
+				if len(mcus) in detected:
+					bs_writer.write(*components[len(mcu)]['itable'][DC][0])
+					diff[components[len(mcu)]['id']] += value
+				else:
+					if diff[components[len(mcu)]['id']] == 0:
+						bs_writer.write(c, d)
+						if length > 0: bs_writer.write(temp, length)
+					else:
+						new_value = value + diff[components[len(mcu)]['id']]
+						if new_value == 0:
+							bs_writer.write(*components[len(mcu)]['itable'][DC][0])
+						else:
+							length = int(math.log(abs(new_value), 2)) + 1
+							value = new_value if new_value > 0 else new_value - 1 + (1 << length)
+							bs_writer.write(*components[len(mcu)]['itable'][DC][length])
+							bs_writer.write(value, length)
+						diff[components[len(mcu)]['id']] = 0
+
+				du.append(value if len(mcus) == 0 else value + mcus[-1][len(mcu)][0])
+
+				d = c = 0
+		elif len(du) < 64:
+			ht = components[len(mcu)]['table'][AC]
+
+			if (c, d) in ht:
+				# AC: ((zeros, length):huff) (value:dc_table)
+				if len(mcus) not in detected: bs_writer.write(c, d)
+
+				temp = ht[(c, d)]
+
+				if temp == 0:
+					du += [0] * (64 - len(du))
+				elif temp == 0xF0:
+					du += [0] * 16
+				else:
+					zeros, length = temp >> 4, temp & 0x0F
+
+					temp = bs_reader.read(length)
+					if len(mcus) not in detected: bs_writer.write(temp, length)
+
+					value = coefficient_lookup_table(temp, length)
+					du += [0] * zeros
+					du.append(value)
+
+				d = c = 0
+		if len(du) >= 64:
+			if len(mcus) in detected: bs_writer.write(*components[len(mcu)]['itable'][AC][0])
+
+			mcu.append(du)
+			du = []
+
+		if len(mcu) == len(components):
+			mcus.append(mcu)
+			mcu = []
+
+
+	pinto_block = { 'indices': b'', 'encoded data': b'' }
+	for pinto_block in pinto_blocks:
+		pinto_block['indices'] += struct.pack('>H', pblock['index'])
+		pinto_block['encoded data'] += struct.pack('>I', len(pblock['encoded data'])) + pblock['encoded data']
+	pinto_block_data = struct.pack('>H', len(pinto_block['indices'])) + pinto_block['indices'] + pinto_block['encoded data']
+
+	modified_jpeg = jpeg[:jd['DATA']['offset']] + bs_writer.result().replace(b'\xFF', b'\xFF\x00') + jpeg[jd['EOI']['offset']:]
+	return modified_jpeg + pinto_block_data
+
+def pixelate(pv_name, ppv_name, mode):
+	pm = PintoMeta.load(PintoConfiguration.pm_path(pv_name))
+	PintoMeta.save(PintoConfiguration.pm_path(ppv_name), pm)
+
+	with PintoVideo(PintoConfiguration.pv_path(pv_name), 'rb') as pv:
+		with PintoVideo(PintoConfiguration.pv_path(ppv_name), 'wb') as ppv:
+			for jpeg in pv:
+
+				# jpeg -(decode)-> image
+				image = cv2.imdecode(numpy.fromstring(jpeg, dtype=numpy.int8), cv2.IMREAD_UNCHANGED)
+
+				# image -(detect)-> pinto blocks
+				pinto_blocks = detect(image, pm.row, pm.column, mode)
+
+				# pinto block -(h pixelate)-(lossless encode)-> encoded pinto block
+				for pinto_block in pinto_blocks:
+					pinto_block['encoded data'] = lossless_encode(h_pixelate(pinto_block['data'], pm.intensity))
+
+				# jpeg + pinto blocks -(erase)-(wrap)-> pixelated jpeg
+				pixelated_jpeg = modify(jpeg, pinto_blocks, pm.row, pm.column) if len(pinto_blocks) > 0 else jpeg
+
+				ppv.write(pixelated_jpeg)
 
 
 
-# blur
-def _blur(ved_file, vmd_file, vbd_file, pbved_file, pbvmd_file):
-    cascades = [ cv2.CascadeClassifier(x) for x in [ '../data/detect/face.xml', '../data/detect/eu.xml', '../data/detect/kr.xml' ] ]
-    
-    # Read vmd file
-    with open(vmd_file, 'r') as vmd:
-        total = vmd.read()
-
-        # Copy vmd to pbvmd
-        with open(pbvmd_file, 'w') as pbvmd:
-            pbvmd.write(total)
-
-        # Parse information
-        data = parse(total)
-        try:
-            video_time = int(data['video_time'])
-            row = int(data['row'])
-            col = int(data['column'])
-            scale = float(data['scale'])
-        except KeyError:
-            print('error: configuration')
-            exit()
-
-    # Description
-    print('blur video')
-    print('  video time  : %d' % video_time)
-    print('  block row   : %d' % row)
-    print('        column: %d' % col)
-    print('        scale : %.1f' % scale)
-    print('  ved file: %s' % ved_file)
-    print('  vmd file: %s' % vmd_file)
-    print('  vbd file: %s' % vbd_file)
-    
-    t = time()
-
-    # Read ved file
-    with open(ved_file, 'rb') as ved:
-
-        with open(pbved_file, 'wb') as pbved:
-            while True:
-                s = ved.read(4)
-                if len(s) == 0: break
-                size = struct.unpack('>I', s)[0]
-                data = ved.read(size)
-                
-                frame = decode(np.fromstring(data, dtype=np.uint8))
-
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-                # detect face & lp or random pick
-                rs= face(frame, cascades[0]) + license_plate(frame, cascades[2])
-
-                # write vbd file
-                s = set()
-                for (x, y, w, h) in rs:
-                    dx, dy = int(col * x / width), int(row * y / height)
-                    ddx, ddy = int(col * (x + w) / width), int(row * (y + h) / height)
-
-                    a = np.array([ x + dx for x in range(ddx - dx + 1) ])
-                    for i in range(ddy - dy + 1):
-                        a += col
-                        s.update(map(str, a.tolist()))
-
-                vbd.write(",".join(list(s)) + '\n')
-
-                # blur
-                for i in s:
-                    if not (0 <= i < row * col):
-                        print('warning: blur index - out of range', i)
-                        continue
-                    r, c = int(i) // col, int(i) % col
-                    x1, y1 = w * c // col, h * r // row
-                    x2, y2 = w * (c + 1) // col, h * (r + 1) // row
-
-                    shrinked = cv2.resize(getROI(frame, x1, y1, x2, y2), None, fx=1.0 / scale, fy=1.0 / scale, interpolation=cv2.INTER_NEAREST)
-                    setROI(frame, x1, y1, x1 + shrinked.shape[1], y1 + shrinked.shape[0], shrinked)
-
-                e = encode(frame)
-                
-                # write pbved file
-                pbved.write(struct.pack('>I', len(e)))
-                pbved.write(e)
-
-    print('  pbved file: %s' % pbved_file)
-    print('')
-    print('  elapsed time: %.3f' % (time() - t))
-    print('')
-
-
-
-
-# main
 if __name__ == '__main__':
-    # python blur.py (ved file) [(vbd file) [(blurred ved file)]]
+	if len(sys.argv) == 4:
+		pv_name, pixelated_pv_name, mode = sys.argv[1:]
 
-
-    # video encoding file path
-    ved_path = '../data/video/'
-    
-    # video meta data file path
-    vmd_path = '../data/meta/'
-
-    # video blur data file path
-    vbd_path = '../data/blur/'
-    
-    
-    if 2 <= len(sys.argv) <= 4:
-        # video encoding file
-        ved_file = ext(filename(sys.argv[1]), 'ved')
-
-        # video meta data file
-        vmd_file = ext(filename(sys.argv[1]), 'vmd')
-
-        # video blur data file
-        if len(sys.argv) == 2:
-            vbd_file = ext(ved_file, 'vbd')
-        else:
-            vbd_file = ext(filename(sys.argv[2]), 'vbd')
-
-        # partial blurred video encoding file
-        if len(sys.argv) == 3:
-            pbved_file = ext(filename(sys.argv[1]) + '_blur', '.ved')
-        else:
-            pbved_file = ext(filename(sys.argv[3]), 'ved')
-            if ved_file == pbved_file:
-                print('same file name')
-                exit(1)
-
-        # partial blurred video meta data file
-        pbvmd_file = ext(pbved_file, 'vmd')
-
-        
-        _blur(ved_path + ved_file, vmd_path + vmd_file, vbd_path + vbd_file, ved_path + pbved_file, vmd_path + pbvmd_file)
-    else:
-        print('python blur.py (original ved file) [(vbd file) [(blurred ved file)]]')
-
-
-
-
-
-            
+		pixelate(pv_name, pixelated_pv_name, mode)
+	else:
+		print('python3 {file} (name) (pixelated name) (none | lp | face | all)'.format(file=sys.argv[0]))

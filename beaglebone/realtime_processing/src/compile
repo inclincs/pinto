@@ -1,4 +1,0 @@
-#!/bin/bash
-
-g++ realtime_processing.cpp sha256.cpp -o realtime_processing `pkg-config opencv --cflags --libs` -lpthread -std=c++11
-mv realtime_processing ../
